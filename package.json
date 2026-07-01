@@ -1,0 +1,10 @@
+{
+  "name": "nacademy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "nAcademy — multi-branch sports academy management (static site: vanilla JS + Firebase Firestore).",
+  "scripts": {
+    "build": "echo \"Static site — no build step needed.\"",
+    "start": "npx serve ."
+  }
+}
