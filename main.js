@@ -139,8 +139,6 @@ function populateRegTrainerSelect() {
   populateRegGroupSelect();
   const sport = document.getElementById('reg-sport');
   if (sport && !sport.options.length) sport.innerHTML = sportOptionsHTML('');
-  const level = document.getElementById('reg-level');
-  if (level && !level.options.length) level.innerHTML = levelOptionsHTML('');
   const method = document.getElementById('reg-method');
   if (method && !method.options.length) method.innerHTML = methodOptionsHTML('');
   // Blank-cards printer: one sport per print run (drives the card numbering).
@@ -176,8 +174,17 @@ function renderRegSportsChips() {
 function updateRegLevelVisibility() {
   const grp = document.getElementById('reg-level-group');
   if (!grp) return;
-  const has = regSports.includes('جمباز فني') || document.getElementById('reg-sport').value === 'جمباز فني';
-  grp.style.display = has ? 'flex' : 'none';
+  const selectedNow = document.getElementById('reg-sport').value;
+  const sports = regSports.slice();
+  if (selectedNow && !sports.includes(selectedNow)) sports.push(selectedNow);
+  const spec = sportLevelSpec(leveledSport(sports));
+  if (spec) {
+    grp.innerHTML = levelFieldHTML('reg-level', spec, val('reg-level'));
+    grp.style.display = 'flex';
+  } else {
+    grp.innerHTML = '';
+    grp.style.display = 'none';
+  }
 }
 function toggleSportLevel() {
   updateRegLevelVisibility();
@@ -250,8 +257,17 @@ function renderEditSportsChips() {
 function updateEditLevelVisibility() {
   const grp = document.getElementById('edit-level-group');
   if (!grp) return;
-  const has = editSports.includes('جمباز فني') || document.getElementById('edit-sport').value === 'جمباز فني';
-  grp.style.display = has ? 'flex' : 'none';
+  const selectedNow = document.getElementById('edit-sport').value;
+  const sports = editSports.slice();
+  if (selectedNow && !sports.includes(selectedNow)) sports.push(selectedNow);
+  const spec = sportLevelSpec(leveledSport(sports));
+  if (spec) {
+    grp.innerHTML = levelFieldHTML('edit-level', spec, val('edit-level'));
+    grp.style.display = 'flex';
+  } else {
+    grp.innerHTML = '';
+    grp.style.display = 'none';
+  }
 }
 function toggleEditSportLevel() {
   updateEditLevelVisibility();
@@ -334,7 +350,7 @@ async function registerTrainee() {
   const sports = regSports.slice();
   if (selectedNow && !sports.includes(selectedNow)) sports.push(selectedNow);
   const sport = sports[0] || '';
-  const level = sports.includes('جمباز فني') ? val('reg-level') : '';
+  const level = leveledSport(sports) ? val('reg-level') : '';
   const trainer = val('reg-trainer').trim();
   const startDate = val('reg-start-date');
   // Every subscription is monthly: it ends by date (duration), never by sessions.
@@ -936,10 +952,10 @@ function editTrainee(index) {
  </div>
  <div id="edit-sports-list" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;"></div>
  </div>
- <div class="form-group" id="edit-level-group" style="display:${traineeSports(t).includes('جمباز فني') ? 'flex' : 'none'};">
- <label>المستوى (جمباز فني)</label>
- <select id="edit-level">${levelOptionsHTML(t.level || '')}</select>
- </div>
+ ${(() => {
+   const spec = sportLevelSpec(leveledSport(traineeSports(t)));
+   return `<div class="form-group" id="edit-level-group" style="display:${spec ? 'flex' : 'none'};">${spec ? levelFieldHTML('edit-level', spec, t.level || '') : ''}</div>`;
+ })()}
  <div class="form-group">
  <label>المدرب المسؤول</label>
  <select id="edit-trainer">${coachOptionsHTML(t.trainer)}</select>
@@ -1023,7 +1039,7 @@ function saveTraineeEdit(index) {
   t.sports = sportsList;
   t.sport = sportsList[0] || '';
   t.plan = t.sport;
-  t.level = sportsList.includes('جمباز فني') ? document.getElementById('edit-level').value : '';
+  t.level = leveledSport(sportsList) && document.getElementById('edit-level') ? document.getElementById('edit-level').value : '';
   t.trainer = document.getElementById('edit-trainer').value.trim() || 'غير محدد';
   t.amount = num(document.getElementById('edit-amount').value);
   t.branch = document.getElementById('edit-branch').value;
@@ -1208,10 +1224,7 @@ function acceptTrial(index) {
  <label>نوع الرياضة</label>
  <select id="accept-sport" onchange="toggleAcceptLevel()">${sportOptionsHTML('')}</select>
  </div>
- <div class="form-group" id="accept-level-group" style="display:none;">
- <label>المستوى (جمباز فني)</label>
- <select id="accept-level" onchange="autofillAcceptSessions()">${levelOptionsHTML('')}</select>
- </div>
+ <div class="form-group" id="accept-level-group" style="display:none;"></div>
  <div class="form-group">
  <label>المدرب المسؤول</label>
  <select id="accept-trainer">${coachOptionsHTML('غير محدد')}</select>
@@ -1246,7 +1259,16 @@ function acceptTrial(index) {
 }
 function toggleAcceptLevel() {
   const grp = document.getElementById('accept-level-group');
-  if (grp) grp.style.display = document.getElementById('accept-sport').value === 'جمباز فني' ? 'flex' : 'none';
+  if (grp) {
+    const spec = sportLevelSpec(document.getElementById('accept-sport').value);
+    if (spec) {
+      grp.innerHTML = levelFieldHTML('accept-level', spec, val('accept-level'));
+      grp.style.display = 'flex';
+    } else {
+      grp.innerHTML = '';
+      grp.style.display = 'none';
+    }
+  }
   autofillAcceptSessions();
 }
 // Auto-fills the accept popup's "sessions per month" from the sport/sector.
@@ -1284,7 +1306,7 @@ function confirmAcceptTrial(index) {
   t.sport = sport;
   t.plan = sport;
   t.sports = [sport];
-  t.level = sport === 'جمباز فني' ? val('accept-level') : '';
+  t.level = sportHasLevel(sport) ? val('accept-level') : '';
   t.trainer = document.getElementById('accept-trainer').value.trim() || 'غير محدد';
   t.subType = 'days';
   t.startDate = todayISO();
@@ -1670,7 +1692,7 @@ function openCardWindow(t) {
     .map(code => {
       const sport = sportForCode(code) || traineeSports(t)[0] || '';
       const color = sportColor(sport);
-      const planText = sport === 'جمباز فني' && t.level ? `${sport} (${t.level})` : sport;
+      const planText = sportHasLevel(sport) && t.level ? `${sport} (${t.level})` : sport;
       return `
  <div class="card" style="--c:${color};">
  <div class="card-top">
@@ -1817,7 +1839,7 @@ const STAFF_CARD_CSS = `
 function traineeCardSlot(t, code, logoUrl) {
   const sport = sportForCode(code) || traineeSports(t)[0] || '';
   const color = sportColor(sport);
-  const planText = sport === 'جمباز فني' && t.level ? `${sport} (${t.level})` : sport;
+  const planText = sportHasLevel(sport) && t.level ? `${sport} (${t.level})` : sport;
   return `<div class="slot"><div class="card" style="--c:${color};">
  <div class="card-top"><div class="brand"><div class="club-name">El Wasl <span>Academy</span></div><div class="club-sub">${planText ? esc(planText) : 'Membership Card'}</div></div><img class="brand-logo" src="${logoUrl}" alt="" onerror="this.style.display='none';"></div>
  <div class="divider"></div>
@@ -4323,8 +4345,46 @@ const SPORTS = [
   'ملاكمه',
   'موياي تاي',
   'كالستانكس',
+  'فيتنس تخصصي',
 ];
 const GYM_LEVELS = ['قطاع مدارس', 'قطاع تجهيزي', 'قطاع فريق'];
+
+// Sports that carry a per-player "level/stage" value, and how it's entered.
+// The value is stored in the SAME `level` field the app already uses:
+//  - kind 'text'   → free-text stage (e.g. "تحت 8" / "تحت 7") for gymnastics.
+//  - kind 'select' → a fixed subscription sector for fitness (مدارس / تجهيزي).
+const SPORT_LEVELS = {
+  'جمباز فني': { label: 'المرحلة', kind: 'text', placeholder: 'مثال: تحت 8 / تحت 7' },
+  'جمباز ايروبك': { label: 'المرحلة', kind: 'text', placeholder: 'مثال: تحت 8 / تحت 7' },
+  'فيتنس تخصصي': { label: 'الاشتراك', kind: 'select', options: ['مدارس', 'تجهيزي'] },
+};
+function sportLevelSpec(sport) {
+  return SPORT_LEVELS[(sport || '').trim()] || null;
+}
+function sportHasLevel(sport) {
+  return !!sportLevelSpec(sport);
+}
+// The first of the chosen sports that carries a level (the app keeps ONE level).
+function leveledSport(sports) {
+  return (sports || []).find(s => SPORT_LEVELS[s]) || '';
+}
+// Builds the inner label+control (text input or select) for a level field,
+// so the same #id works with val()/.value whether it's an <input> or <select>.
+function levelFieldHTML(id, spec, current) {
+  if (!spec) return '';
+  const label = `<label>${esc(spec.label)}</label>`;
+  if (spec.kind === 'select') {
+    return (
+      label +
+      `<select id="${id}"><option value="">— اختر —</option>` +
+      spec.options.map(o => `<option value="${esc(o)}" ${o === current ? 'selected' : ''}>${esc(o)}</option>`).join('') +
+      `</select>`
+    );
+  }
+  return (
+    label + `<input type="text" id="${id}" placeholder="${esc(spec.placeholder || '')}" value="${esc(current || '')}">`
+  );
+}
 
 // Every subscription is monthly (it ends by date, not by sessions). The number
 // of sessions per month is fixed per sport/sector and only auto-fills the form
@@ -4418,6 +4478,7 @@ const SPORT_COLORS = {
   ملاكمه: '#7B241C',
   'موياي تاي': '#BA4A00',
   كالستانكس: '#E84393',
+  'فيتنس تخصصي': '#34495E',
 };
 function sportColor(sport) {
   return SPORT_COLORS[(sport || '').trim()] || '#D4AF37';
