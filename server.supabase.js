@@ -97,6 +97,20 @@ let historyFullyLoaded = false;
 let defaultHistoryLoaded = false;
 let loadedSections = { attendance: false, payments: false, expenses: false, staffAttendance: false, feedback: false };
 
+// ---- Overlapping-load guard: each load takes a generation number; a section
+// is only written if no NEWER load already wrote it. Otherwise a slow, older
+// response (e.g. a 14-day window) could clobber data a newer one (e.g. the
+// full history) had just applied. ----
+let loadGen = 0;
+const sectionGen = {};
+function applySection(name, gen, rows) {
+  if (gen < (sectionGen[name] || 0)) return false; // stale response — discard
+  sectionGen[name] = gen;
+  data[name] = rows.map(rowToRecord);
+  loadedSections[name] = true;
+  return true;
+}
+
 // Per-device branch scope. '' = all branches (admin). A legacy stored value
 // (pre-merge branch name) is normalized to the merged branch.
 let currentBranch = normalizeBranch(localStorage.getItem('device-branch') || '');
@@ -262,10 +276,10 @@ async function loadSection(name) {
   if (!table) return;
   const days = name === 'attendance' ? ATTENDANCE_DAYS : HISTORY_DAYS;
   const cutoff = Date.now() - days * 86400000;
+  const gen = ++loadGen;
   try {
     const rows = await fetchRows(table, q => branchSel(q).gte('ts', cutoff));
-    data[name] = rows.map(rowToRecord);
-    loadedSections[name] = true;
+    if (!applySection(name, gen, rows)) return;
     cacheLocally();
   } catch (err) {
     console.error(`loadSection(${name}) error:`, err);
@@ -287,6 +301,8 @@ async function ensureSection(name, renderFn) {
 
 // Load history for a chosen date range (reports / financial dashboard).
 async function loadHistoryRange(fromTs, toTs) {
+  const gen = ++loadGen;
+  let allApplied = true;
   try {
     showNotification('جارٍ تحميل بيانات الفترة المحددة...');
     await Promise.all(
@@ -296,10 +312,11 @@ async function loadHistoryRange(fromTs, toTs) {
           if (toTs) qq = qq.lte('ts', toTs);
           return qq;
         });
-        data[name] = rows.map(rowToRecord);
-        loadedSections[name] = true;
+        if (!applySection(name, gen, rows)) allApplied = false;
       }),
     );
+    // A newer load overwrote part of this one — its own flags win.
+    if (!allApplied) return;
     historyFullyLoaded = false;
     defaultHistoryLoaded = true;
     cacheLocally();
@@ -323,15 +340,18 @@ async function loadAllHistory() {
     showNotification('السجل الكامل محمّل بالفعل');
     return;
   }
+  const gen = ++loadGen;
+  let allApplied = true;
   try {
     showNotification('جارٍ تحميل السجل الكامل...');
     await Promise.all(
       Object.keys(historyTables).map(async name => {
         const rows = await fetchRows(historyTables[name], branchSel);
-        data[name] = rows.map(rowToRecord);
-        loadedSections[name] = true;
+        if (!applySection(name, gen, rows)) allApplied = false;
       }),
     );
+    // A newer, narrower load overwrote part of this one — don't claim "full".
+    if (!allApplied) return;
     historyFullyLoaded = true;
     defaultHistoryLoaded = true;
     await recomputeStats();
@@ -415,6 +435,9 @@ async function dbSetDoc(table, id, obj) {
 
 // Used for attendance (auto-generated id). trainee_id is extracted so a
 // player's attendance can be deleted when the player is removed.
+// Returns { ok, duplicate }: `duplicate` is true when the DB's unique index
+// rejected the row (another device already inserted the same attendance) —
+// callers undo their local copy instead of showing a scary error.
 async function dbAddDoc(table, obj) {
   if (obj && obj.ts == null) obj.ts = Date.now();
   if (obj && obj.createdBy == null && auth.currentUser) obj.createdBy = auth.currentUser.email;
@@ -424,9 +447,12 @@ async function dbAddDoc(table, obj) {
   try {
     const { error } = await sb.from(table).insert(row);
     if (error) throw error;
+    return { ok: true, duplicate: false };
   } catch (err) {
+    if (err && err.code === '23505') return { ok: false, duplicate: true };
     console.error('Supabase add error:', err);
     showNotification('تم الحفظ محلياً، لكن تعذر رفعه لقاعدة البيانات. تحقق من الاتصال', 'danger');
+    return { ok: false, duplicate: false };
   }
 }
 
@@ -467,6 +493,15 @@ async function dbSaveCounter() {
   } catch (err) {
     console.error('Supabase counter error:', err);
   }
+}
+
+// Checks the WHOLE table (not this device's branch-filtered copy) for an id.
+// Used when generating a new player id: another branch's player is invisible
+// locally, so only the DB can say the id is really free.
+async function dbIdExists(table, id) {
+  const { data: row, error } = await sb.from(table).select('id').eq('id', String(id)).maybeSingle();
+  if (error) throw error;
+  return !!row;
 }
 
 // Atomically reserve the next trainee number via the next_counter() SQL
