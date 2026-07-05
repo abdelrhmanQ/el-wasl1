@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Local dev server logs
+*.log
+server-local.log
+
+# Local tooling / editor settings
+.claude/
+.vscode/
+.DS_Store
+
+# Environment / secrets (never commit credentials)
+.env
+.env.*
