@@ -290,6 +290,10 @@
  </div>
  <div class="form-group sub-only" id="reg-level-group" style="display:none;"></div>
  <div class="form-group sub-only">
+ <label>الفريق / المرحلة (يدوي)</label>
+ <input type="text" id="reg-stage" placeholder="مثال: فريق تحت 8 / تحت 7">
+ </div>
+ <div class="form-group sub-only">
  <label>المدرب المسؤول</label>
  <select id="reg-trainer" onchange="populateRegGroupSelect()"><option value="غير محدد">— غير محدد —</option></select>
  </div>
@@ -455,13 +459,25 @@
  <!-- Blank branded cards / barcodes -->
  <div class="card">
  <div class="card-title">طباعة كروت بأكواد جاهزة</div>
- <p style="color: rgba(48,56,65,0.5); font-size: 13px; margin-bottom: 14px;">كل كرت يُطبع عليه كود تسلسلي فريد حسب الرياضة + QR والتصميم. تكتب الاسم يدوياً، وعند تسجيل اللاعب تُدخل كود الكرت في خانة "كود البطاقة".</p>
+ <p style="color: rgba(48,56,65,0.5); font-size: 13px; margin-bottom: 14px;">كل كرت يُطبع عليه كود منظّم فريد بالشكل <b>الفرع-الرياضة-المرحلة-التسلسل</b> (مثال: <code>C-KA-U9-0001</code>، والجمباز <code>C-WAG-U9-T-0001</code>) + QR. تكتب الاسم يدوياً، وعند تسجيل اللاعب تُدخل كود الكرت في خانة "كود البطاقة". لا يمكن لفرع طباعة كروت فرع آخر.</p>
  <div style="display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
- <div class="form-group" style="max-width: 220px; margin-bottom: 0;">
- <label>الرياضة</label>
- <select id="blank-cards-sport"></select>
+ <div class="form-group" style="max-width: 200px; margin-bottom: 0;">
+ <label>الفرع</label>
+ <select id="blank-cards-branch"></select>
  </div>
- <div class="form-group" style="max-width: 180px; margin-bottom: 0;">
+ <div class="form-group" style="max-width: 200px; margin-bottom: 0;">
+ <label>الرياضة</label>
+ <select id="blank-cards-sport" onchange="onBlankSportChange()"></select>
+ </div>
+ <div class="form-group" style="max-width: 140px; margin-bottom: 0;">
+ <label>المرحلة السنية</label>
+ <select id="blank-cards-age"></select>
+ </div>
+ <div class="form-group" id="blank-cards-sector-group" style="max-width: 170px; margin-bottom: 0; display: none;">
+ <label>القطاع (جمباز)</label>
+ <select id="blank-cards-sector"></select>
+ </div>
+ <div class="form-group" style="max-width: 140px; margin-bottom: 0;">
  <label>عدد الكروت</label>
  <input type="number" id="blank-cards-qty" value="10" min="1" max="1000">
  </div>
@@ -529,6 +545,7 @@
 
  <div class="card">
  <div class="card-title">قائمة اللاعبين التجريبيين</div>
+ <input type="text" class="table-filter" placeholder="🔍 بحث عن لاعب تجريبي (اسم / هاتف / فرع)..." oninput="filterTableRows(this, 'trials-table')">
  <div class="table-container">
  <table>
  <thead>
@@ -610,6 +627,7 @@
  <button class="btn btn-outline btn-sm" onclick="loadAllHistory()" title="افتراضياً يُعرض سجل آخر 14 يوم فقط لتوفير الاستهلاك. اضغط لتحميل كل الفترة.">📂 تحميل كل السجل (الفترة كاملة)</button>
  </div>
  <p style="color: rgba(48,56,65,0.4); font-size: 12px; margin: 6px 0 14px;">يُعرض سجل آخر 14 يوم افتراضياً لتقليل استهلاك قاعدة البيانات.</p>
+ <input type="text" class="table-filter" placeholder="🔍 بحث في الحضور (اسم / كود)..." oninput="filterTableRows(this, 'attendance-log')">
  <div class="table-container">
  <table>
  <thead>
@@ -773,6 +791,7 @@
 
  <div class="card">
  <div class="card-title">قائمة الموظفين — حضور اليوم</div>
+ <input type="text" class="table-filter" placeholder="🔍 بحث عن موظف (اسم / كود)..." oninput="filterTableRows(this, 'staff-attendance-table')">
  <div class="table-container">
  <table>
  <thead>
@@ -867,6 +886,7 @@
 
  <div class="card">
  <div class="card-title">قائمة المدربين والرواتب</div>
+ <input type="text" class="table-filter" placeholder="🔍 بحث عن مدرب (اسم / تخصص / فرع)..." oninput="filterTableRows(this, 'coaches-table')">
  <div class="table-container">
  <table>
  <thead>
@@ -887,6 +907,13 @@
  </tr>
  </tbody>
  </table>
+ </div>
+
+ <!-- Coach comparison: who brings in more money / more players -->
+ <div class="card" style="margin-top: 20px;">
+ <div class="card-title">مقارنة المدربين — الأعلى تحصيلاً وعدداً للاعبين</div>
+ <p style="color: rgba(48,56,65,0.5); font-size: 13px; margin-bottom: 14px;">الترتيب حسب إجمالي المحصّل من لاعبي كل مدرب (نفس أساس حساب النسبة)، مع عدد اللاعبين المسجلين معه حالياً.</p>
+ <div id="coach-compare"></div>
  </div>
  </div>
  </div>
@@ -965,6 +992,7 @@
  <!-- Payments Table -->
  <div class="card">
  <div class="card-title">سجل المدفوعات</div>
+ <input type="text" class="table-filter" placeholder="🔍 بحث في المدفوعات (اسم / نوع / فرع)..." oninput="filterTableRows(this, 'payments-table')">
  <div class="table-container">
  <table>
  <thead>
@@ -1102,6 +1130,7 @@
  <!-- Employees Table -->
  <div class="card" id="card-employees-table">
  <div class="card-title">قائمة الموظفين والمرتبات</div>
+ <input type="text" class="table-filter" placeholder="🔍 بحث عن موظف (اسم / وظيفة / فرع)..." oninput="filterTableRows(this, 'employees-table')">
  <div class="table-container">
  <table>
  <thead>
@@ -1129,6 +1158,7 @@
  <!-- Expenses Table -->
  <div class="card" id="card-expenses-table">
  <div class="card-title">سجل المصروفات والإيجار</div>
+ <input type="text" class="table-filter" placeholder="🔍 بحث في المصروفات (نوع / وصف / فرع)..." oninput="filterTableRows(this, 'expenses-table')">
  <div class="table-container">
  <table>
  <thead>
