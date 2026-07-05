@@ -76,12 +76,22 @@ function showSection(name) {
 
 // Generates a unique trainee code like "Wasl-0427" using random digits,
 // checking against existing trainees so two players never share an ID.
-function generateID() {
-  for (let i = 0; i < 80; i++) {
-    const id = `Wasl-${String(Math.floor(Math.random() * 10000)).padStart(4, '0')}`;
-    if (!data.trainees.some(t => t.id === id)) return id;
+// New auto ids come from the ATOMIC next_counter() sequence in the DB, so two
+// devices can never reserve the same number. (The old random pick only checked
+// this device's branch-filtered copy — two branches could hand out the same id
+// and the second registration would silently overwrite the first.) Legacy
+// random ids may already occupy a number, so keep taking the next counter
+// value until one is free — checked locally AND against the whole table.
+async function generateID() {
+  try {
+    for (let i = 0; i < 50; i++) {
+      const id = `Wasl-${String(await nextCounterValue()).padStart(4, '0')}`;
+      if (!findTraineeByCode(id) && !(await dbIdExists(traineesCol, id))) return id;
+    }
+  } catch (e) {
+    console.error('generateID: DB unreachable, using offline id', e);
   }
-  // Fallback if the 4-digit space is unexpectedly crowded.
+  // Offline fallback: timestamp-based, practically collision-free.
   return `Wasl-${Date.now().toString().slice(-6)}`;
 }
 
@@ -141,9 +151,46 @@ function populateRegTrainerSelect() {
   if (sport && !sport.options.length) sport.innerHTML = sportOptionsHTML('');
   const method = document.getElementById('reg-method');
   if (method && !method.options.length) method.innerHTML = methodOptionsHTML('');
-  // Blank-cards printer: one sport per print run (drives the card numbering).
+  // Blank-cards printer: branch (locked to this device's branch) + sport +
+  // age band + a gymnastics-only sector all feed the structured card code.
+  populateBlankCardsForm();
+}
+
+// Fills the print-cards dropdowns. The branch list is limited to this device's
+// branch (empty = admin can print any), enforcing "a branch can't print for
+// another branch". Safe to call repeatedly — only fills empty selects.
+function populateBlankCardsForm() {
+  const branchSel = document.getElementById('blank-cards-branch');
+  if (branchSel && !branchSel.options.length) {
+    const dev = getDeviceBranch();
+    const list = dev ? [dev] : BRANCHES;
+    branchSel.innerHTML = list
+      .map(b => `<option value="${esc(b)}">${esc(b)} (${BRANCH_CODES[b] || '؟'})</option>`)
+      .join('');
+    branchSel.disabled = !!dev; // scoped device: locked to its own branch
+  }
   const cardSport = document.getElementById('blank-cards-sport');
   if (cardSport && !cardSport.options.length) cardSport.innerHTML = sportOptionsHTML('');
+  const ageSel = document.getElementById('blank-cards-age');
+  if (ageSel && !ageSel.options.length) {
+    ageSel.innerHTML = AGE_BANDS.map(a => `<option value="${a}" ${a === 'U9' ? 'selected' : ''}>${a}</option>`).join(
+      '',
+    );
+  }
+  const sectorSel = document.getElementById('blank-cards-sector');
+  if (sectorSel && !sectorSel.options.length) {
+    sectorSel.innerHTML =
+      '<option value="">— اختر —</option>' +
+      GYM_SECTORS.map(s => `<option value="${esc(s)}">${esc(s)} (${GYM_SECTOR_CODES[s]})</option>`).join('');
+  }
+  onBlankSportChange();
+}
+
+// Shows the gymnastics sector picker only when a gymnastics sport is selected.
+function onBlankSportChange() {
+  const grp = document.getElementById('blank-cards-sector-group');
+  const sport = val('blank-cards-sport');
+  if (grp) grp.style.display = isGymSport(sport) ? '' : 'none';
 }
 
 // ---- Multi-sport registration: a player can have more than one sport. ----
@@ -384,7 +431,7 @@ async function registerTrainee() {
       return;
     }
   }
-  if (codes.length === 0) codes.push(generateID());
+  if (codes.length === 0) codes.push(await generateID());
   const id = codes[0]; // primary id = first code
 
   const today = todayAr();
@@ -427,11 +474,13 @@ async function registerTrainee() {
     attendanceCount: 0,
     branch: branch,
     source: source || '',
+    stage: val('reg-stage'), // free-text team/stage, e.g. "فريق تحت 8" (independent field)
   };
 
   data.trainees.push(trainee);
   dbSetDoc(traineesCol, trainee.id, trainee);
-  // Note: the counter was already persisted atomically by generateID().
+  // Auto-generated ids reserved their number atomically inside generateID();
+  // user-typed card codes were checked for duplicates above.
 
   // Drop the new player straight into the chosen coach group (if any).
   const regGroup = (data.groups || []).find(g => g._docId === val('reg-group'));
@@ -560,6 +609,10 @@ function clearForm() {
   document.getElementById('reg-total').value = '';
   document.getElementById('reg-amount').value = '';
   document.getElementById('reg-notes').value = '';
+  {
+    const s = document.getElementById('reg-stage');
+    if (s) s.value = '';
+  }
   document.getElementById('reg-card-code').value = '';
   document.getElementById('id-result').classList.remove('show');
   regSports = [];
@@ -957,6 +1010,10 @@ function editTrainee(index) {
    return `<div class="form-group" id="edit-level-group" style="display:${spec ? 'flex' : 'none'};">${spec ? levelFieldHTML('edit-level', spec, t.level || '') : ''}</div>`;
  })()}
  <div class="form-group">
+ <label>الفريق / المرحلة (يدوي)</label>
+ <input type="text" id="edit-stage" value="${esc(t.stage || '')}" placeholder="مثال: فريق تحت 8 / تحت 7">
+ </div>
+ <div class="form-group">
  <label>المدرب المسؤول</label>
  <select id="edit-trainer">${coachOptionsHTML(t.trainer)}</select>
  </div>
@@ -1039,7 +1096,11 @@ function saveTraineeEdit(index) {
   t.sports = sportsList;
   t.sport = sportsList[0] || '';
   t.plan = t.sport;
-  t.level = leveledSport(sportsList) && document.getElementById('edit-level') ? document.getElementById('edit-level').value : '';
+  t.level =
+    leveledSport(sportsList) && document.getElementById('edit-level')
+      ? document.getElementById('edit-level').value
+      : '';
+  t.stage = val('edit-stage');
   t.trainer = document.getElementById('edit-trainer').value.trim() || 'غير محدد';
   t.amount = num(document.getElementById('edit-amount').value);
   t.branch = document.getElementById('edit-branch').value;
@@ -1112,7 +1173,7 @@ const TRIAL_KEEP_DAYS = 7;
 
 // Register a free trial — collects the player's data only (no payment) and
 // files it as "pending" in this section, separate from the real players.
-function registerTrial() {
+async function registerTrial() {
   const name = val('trial-name').trim();
   const phone = val('trial-phone').trim();
   const branch = val('trial-branch');
@@ -1125,7 +1186,7 @@ function registerTrial() {
     return;
   }
 
-  const id = generateID();
+  const id = await generateID();
   const trainee = {
     id,
     codes: [id],
@@ -1226,6 +1287,10 @@ function acceptTrial(index) {
  </div>
  <div class="form-group" id="accept-level-group" style="display:none;"></div>
  <div class="form-group">
+ <label>الفريق / المرحلة (يدوي)</label>
+ <input type="text" id="accept-stage" placeholder="مثال: فريق تحت 8 / تحت 7">
+ </div>
+ <div class="form-group">
  <label>المدرب المسؤول</label>
  <select id="accept-trainer">${coachOptionsHTML('غير محدد')}</select>
  </div>
@@ -1307,6 +1372,7 @@ function confirmAcceptTrial(index) {
   t.plan = sport;
   t.sports = [sport];
   t.level = sportHasLevel(sport) ? val('accept-level') : '';
+  t.stage = val('accept-stage');
   t.trainer = document.getElementById('accept-trainer').value.trim() || 'غير محدد';
   t.subType = 'days';
   t.startDate = todayISO();
@@ -1666,6 +1732,28 @@ function renderRefunds() {
     .join('');
 }
 
+// ==================== CARD BRANDING ====================
+// Academy contact details printed on the BACK of every card.
+const ACADEMY_PHONES = ['01150011836', '01021811713'];
+const ACADEMY_INSTAGRAM = 'alwasl.academy.eg';
+const ACADEMY_FACEBOOK = 'El Wasl Academy';
+// Faint, centred logo watermark that sits behind the card content.
+function cardWatermark(logoUrl) {
+  return `<img class="card-wm" src="${logoUrl}" alt="" onerror="this.style.display='none';">`;
+}
+// The BACK face of a card: big logo + academy name + phones + social handles.
+// Same dark theme as the front; used as a second page/slot for double-sided print.
+function cardBackInnerHTML(logoUrl) {
+  return `${cardWatermark(logoUrl)}
+ <img class="back-logo" src="${logoUrl}" alt="" onerror="this.style.display='none';">
+ <div class="back-name">El Wasl <span>Academy</span></div>
+ <div class="back-contacts">
+ <div class="bc bc-phones">📞 ${ACADEMY_PHONES.join('  ·  ')}</div>
+ <div class="bc">📷 Instagram: ${esc(ACADEMY_INSTAGRAM)}</div>
+ <div class="bc">ⓕ Facebook: ${esc(ACADEMY_FACEBOOK)}</div>
+ </div>`;
+}
+
 function printID() {
   const id = document.getElementById('generated-id').textContent;
   const trainee = data.trainees.find(t => t.id === id);
@@ -1691,7 +1779,7 @@ function openCardWindow(t) {
   const cards = list
     .map(code => {
       const sport = sportForCode(code) || traineeSports(t)[0] || '';
-      const color = sportColor(sport);
+      const color = branchColor(t.branch);
       const planText = sportHasLevel(sport) && t.level ? `${sport} (${t.level})` : sport;
       return `
  <div class="card" style="--c:${color};">
@@ -1714,7 +1802,8 @@ function openCardWindow(t) {
  <div class="qr-box"><div class="qr" data-code="${esc(code)}"></div></div>
  </div>
  <div class="card-footer">يُستخدم هذا الكود لتسجيل الحضور عند الدخول</div>
- </div>`;
+ </div>
+ <div class="card back" style="--c:${color};">${cardBackInnerHTML(logoUrl)}</div>`;
     })
     .join('');
 
@@ -1730,14 +1819,15 @@ function openCardWindow(t) {
  .card {
  position: relative; width: 90mm; height: 56mm; overflow: hidden;
  background:
- radial-gradient(60mm 40mm at 88% 8%, color-mix(in srgb, var(--c) 18%, transparent), transparent 60%),
- linear-gradient(135deg, #1B2433 0%, #243049 60%, #18212f 100%);
+ radial-gradient(60mm 40mm at 88% 8%, color-mix(in srgb, var(--c) 38%, transparent), transparent 62%),
+ radial-gradient(50mm 34mm at 8% 100%, color-mix(in srgb, var(--c) 22%, transparent), transparent 65%),
+ linear-gradient(135deg, #000000 0%, #0A0A0A 55%, #000000 100%);
  border-radius: 8px; padding: 4.5mm 5mm;
  display: flex; flex-direction: column; justify-content: space-between; color: #E9EDF3;
  page-break-after: always;
  }
- .card::before { content: ''; position: absolute; inset: 1.1mm; border: 0.5mm solid var(--c); border-radius: 6px; pointer-events: none; }
- .card::after { content: ''; position: absolute; top: 0; right: 0; left: 0; height: 1.6mm; background: var(--c); }
+ /* card border (edges) removed */
+ /* top colour strip removed */
  .card-top { display: flex; justify-content: space-between; align-items: center; z-index: 1; }
  .brand { line-height: 1.1; }
  .club-name { font-size: 15px; font-weight: 900; letter-spacing: 1px; color: #ffffff; }
@@ -1753,6 +1843,14 @@ function openCardWindow(t) {
  .member-code { font-size: 13px; font-family: 'Courier New', monospace; letter-spacing: 1px; color: #E9EDF3; font-weight: 700; }
  .qr-box { background: #ffffff; padding: 1.2mm; border-radius: 1.5mm; line-height: 0; box-shadow: 0 0 0 0.4mm var(--c); }
  .card-footer { font-size: 6.5px; color: var(--c); text-align: center; letter-spacing: 0.5px; z-index: 1; }
+ .card-wm { position: absolute; width: 40mm; height: auto; top: 50%; left: 50%; transform: translate(-50%, -50%); opacity: 0.06; filter: brightness(0) invert(1); z-index: 0; }
+ .card.back { justify-content: center; align-items: center; text-align: center; gap: 1.5mm; }
+ .back-logo { height: 17mm; width: auto; z-index: 1; }
+ .back-name { font-size: 15px; font-weight: 900; color: #fff; letter-spacing: 1px; z-index: 1; }
+ .back-name span { color: var(--c); }
+ .back-contacts { z-index: 1; margin-top: 1mm; }
+ .bc { font-size: 8px; color: #D6DBE2; line-height: 1.75; letter-spacing: 0.3px; }
+ .bc.bc-phones { color: var(--c); font-weight: 800; font-size: 9px; margin-bottom: 0.8mm; }
  </style>
  </head>
  <body>
@@ -1794,9 +1892,9 @@ const SHEET_BASE_CSS = `
 
 // Player card look (same as the single window, minus the per-card page break).
 const TRAINEE_CARD_CSS = `
- .card { position: relative; width: 90mm; height: 56mm; overflow: hidden; background: radial-gradient(60mm 40mm at 88% 8%, color-mix(in srgb, var(--c) 18%, transparent), transparent 60%), linear-gradient(135deg, #1B2433 0%, #243049 60%, #18212f 100%); border-radius: 8px; padding: 4.5mm 5mm; display: flex; flex-direction: column; justify-content: space-between; color: #E9EDF3; }
- .card::before { content: ''; position: absolute; inset: 1.1mm; border: 0.5mm solid var(--c); border-radius: 6px; pointer-events: none; }
- .card::after { content: ''; position: absolute; top: 0; right: 0; left: 0; height: 1.6mm; background: var(--c); }
+ .card { position: relative; width: 90mm; height: 56mm; overflow: hidden; background: radial-gradient(60mm 40mm at 88% 8%, color-mix(in srgb, var(--c) 38%, transparent), transparent 62%), radial-gradient(50mm 34mm at 8% 100%, color-mix(in srgb, var(--c) 22%, transparent), transparent 65%), linear-gradient(135deg, #000000 0%, #0A0A0A 55%, #000000 100%); border-radius: 8px; padding: 4.5mm 5mm; display: flex; flex-direction: column; justify-content: space-between; color: #E9EDF3; }
+ /* card border (edges) removed */
+ /* top colour strip removed */
  .card-top { display: flex; justify-content: space-between; align-items: center; z-index: 1; }
  .brand { line-height: 1.1; }
  .club-name { font-size: 15px; font-weight: 900; letter-spacing: 1px; color: #ffffff; }
@@ -1812,6 +1910,14 @@ const TRAINEE_CARD_CSS = `
  .member-code { font-size: 13px; font-family: 'Courier New', monospace; letter-spacing: 1px; color: #E9EDF3; font-weight: 700; }
  .qr-box { background: #ffffff; padding: 1.2mm; border-radius: 1.5mm; line-height: 0; box-shadow: 0 0 0 0.4mm var(--c); }
  .card-footer { font-size: 6.5px; color: var(--c); text-align: center; letter-spacing: 0.5px; z-index: 1; }
+ .card-wm { position: absolute; width: 40mm; height: auto; top: 50%; left: 50%; transform: translate(-50%, -50%); opacity: 0.06; filter: brightness(0) invert(1); z-index: 0; }
+ .card.back { justify-content: center; align-items: center; text-align: center; gap: 1.5mm; }
+ .back-logo { height: 17mm; width: auto; z-index: 1; }
+ .back-name { font-size: 15px; font-weight: 900; color: #fff; letter-spacing: 1px; z-index: 1; }
+ .back-name span { color: var(--c); }
+ .back-contacts { z-index: 1; margin-top: 1mm; }
+ .bc { font-size: 8px; color: #D6DBE2; line-height: 1.75; letter-spacing: 0.3px; }
+ .bc.bc-phones { color: var(--c); font-weight: 800; font-size: 9px; margin-bottom: 0.8mm; }
  `;
 
 // Staff card look (deep-gold accent), colours inlined (constant per staff card).
@@ -1838,7 +1944,7 @@ const STAFF_CARD_CSS = `
 // One player card (a single code) as an A4-sheet slot.
 function traineeCardSlot(t, code, logoUrl) {
   const sport = sportForCode(code) || traineeSports(t)[0] || '';
-  const color = sportColor(sport);
+  const color = branchColor(t.branch);
   const planText = sportHasLevel(sport) && t.level ? `${sport} (${t.level})` : sport;
   return `<div class="slot"><div class="card" style="--c:${color};">
  <div class="card-top"><div class="brand"><div class="club-name">El Wasl <span>Academy</span></div><div class="club-sub">${planText ? esc(planText) : 'Membership Card'}</div></div><img class="brand-logo" src="${logoUrl}" alt="" onerror="this.style.display='none';"></div>
@@ -1846,6 +1952,11 @@ function traineeCardSlot(t, code, logoUrl) {
  <div class="card-body"><div class="card-info"><div class="lbl">الاسم</div><div class="member-name">${esc(t.name || '')}</div>${planText ? `<div class="member-plan">${esc(planText)}</div>` : ''}<div class="lbl">الكود</div><div class="member-code">${esc(code)}</div></div><div class="qr-box"><div class="qr" data-code="${esc(code)}"></div></div></div>
  <div class="card-footer">يُستخدم هذا الكود لتسجيل الحضور عند الدخول</div>
  </div></div>`;
+}
+
+// The back face as an A4-sheet slot (academy contact info, branch-coloured).
+function cardBackSlot(color, logoUrl) {
+  return `<div class="slot"><div class="card back" style="--c:${color};">${cardBackInnerHTML(logoUrl)}</div></div>`;
 }
 
 // One staff card as an A4-sheet slot.
@@ -1894,7 +2005,10 @@ function printTraineeCardsSheet(branch) {
   const slots = [];
   list.forEach(t =>
     traineeCodes(t).forEach(code => {
-      if (code) slots.push(traineeCardSlot(t, code, logoUrl));
+      if (code) {
+        slots.push(traineeCardSlot(t, code, logoUrl));
+        slots.push(cardBackSlot(branchColor(t.branch), logoUrl));
+      }
     }),
   );
   if (!slots.length) {
@@ -1930,7 +2044,7 @@ function onAttendanceInput() {
   }, 150);
 }
 
-function recordAttendance() {
+async function recordAttendance() {
   const raw = document.getElementById('attendance-code').value.trim();
 
   if (!raw) {
@@ -1993,9 +2107,20 @@ function recordAttendance() {
     code: raw,
   };
   data.attendance.push(attendanceEntry);
-  dbAddDoc(attendanceCol, attendanceEntry);
+  // Await the insert: the DB's unique index is the real duplicate guard — the
+  // local check above can't see another device's check-in from seconds ago.
+  const res = await dbAddDoc(attendanceCol, attendanceEntry);
+  if (res && res.duplicate) {
+    // Another device already recorded this player today — undo the local copy.
+    data.attendance.splice(data.attendance.indexOf(attendanceEntry), 1);
+    renderAttendanceCard(trainee, info, { state: 'already', sport: attendedSport });
+    document.getElementById('attendance-code').value = '';
+    updateAttendanceLog();
+    return;
+  }
 
-  // Consume one session for session-based subscriptions.
+  // Consume one session for session-based subscriptions. Runs only when this
+  // device's insert won the race, so two devices can't both decrement.
   if (trainee.type === 'subscription' && info.kind === 'sessions') {
     trainee.sessionsRemaining = num(trainee.sessionsRemaining) - 1;
     if (trainee.sessionsRemaining <= 0) trainee.status = 'منتهي';
@@ -2756,7 +2881,7 @@ function removeMemberFromGroup(groupId, code) {
 
 // Records attendance for every "present"-checked member at once. Skips
 // members already checked in today and blocks expired subscriptions.
-function recordGroupAttendance(groupId) {
+async function recordGroupAttendance(groupId) {
   const g = (data.groups || []).find(x => x._docId === groupId);
   if (!g) return;
   const today = todayAr();
@@ -2765,30 +2890,36 @@ function recordGroupAttendance(groupId) {
     blocked = 0,
     dup = 0;
 
-  (g.memberIds || []).forEach(mid => {
+  for (const mid of g.memberIds || []) {
     const t = data.trainees.find(x => x.id === mid);
-    if (!t) return;
+    if (!t) continue;
     const cb = document.getElementById(`grp-present-${mid}`);
     const isPresent = cb ? cb.checked : false;
     const info = subInfo(t);
 
     if (t.type === 'subscription' && info.expired) {
       blocked++;
-      return;
+      continue;
     }
     if (!isPresent) {
       absent++;
-      return;
+      continue;
     }
     if (data.attendance.some(a => a.id === mid && a.date === today)) {
       dup++;
-      return;
+      continue;
     }
 
     const time = new Date().toLocaleTimeString('ar-EG');
     const entry = { id: mid, name: t.name, date: today, time, status: 'حاضر', branch: t.branch || 'غير محدد' };
     data.attendance.push(entry);
-    dbAddDoc(attendanceCol, entry);
+    // DB unique index is the cross-device duplicate guard (see recordAttendance).
+    const res = await dbAddDoc(attendanceCol, entry);
+    if (res && res.duplicate) {
+      data.attendance.splice(data.attendance.indexOf(entry), 1);
+      dup++;
+      continue;
+    }
 
     if (t.type === 'subscription' && info.kind === 'sessions') {
       t.sessionsRemaining = num(t.sessionsRemaining) - 1;
@@ -2796,7 +2927,7 @@ function recordGroupAttendance(groupId) {
       dbSetDoc(traineesCol, t.id, t);
     }
     present++;
-  });
+  }
 
   updateAttendanceLog();
   updateTraineesTable();
@@ -2991,6 +3122,7 @@ function renderCoachesSection() {
   const tbody = document.getElementById('coaches-table');
   if (!tbody) return;
   const coaches = getCoaches();
+  renderCoachComparison(coaches);
   if (coaches.length === 0) {
     tbody.innerHTML =
       '<tr><td colspan="8" style="text-align:center; color: rgba(48,56,65,0.3); padding: 30px;">لا يوجد مدربون مسجلون</td></tr>';
@@ -3027,6 +3159,62 @@ function renderCoachesSection() {
  </tr>`;
     })
     .join('');
+}
+
+// Coach comparison board: ranks every coach by total money collected from his
+// players (same commission base as the percentage payout) alongside how many
+// players are currently assigned to him. Bars are relative to the top coach.
+function renderCoachComparison(coaches) {
+  const box = document.getElementById('coach-compare');
+  if (!box) return;
+  if (!coaches || coaches.length === 0) {
+    box.innerHTML = '<p style="text-align:center; color:rgba(48,56,65,0.3); padding:20px;">لا يوجد مدربون للمقارنة</p>';
+    return;
+  }
+  const rows = coaches
+    .map(c => ({
+      name: c.name,
+      branch: c.branch,
+      collected: collectedForCoach(c.name),
+      players: (data.trainees || []).filter(t => (t.trainer || '').trim() === c.name).length,
+    }))
+    .sort((a, b) => b.collected - a.collected || b.players - a.players);
+  const maxMoney = Math.max(1, ...rows.map(r => r.collected));
+  const maxPlayers = Math.max(1, ...rows.map(r => r.players));
+  const medal = i => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}`);
+  box.innerHTML = `
+ <table style="width:100%; border-collapse:collapse; font-size:13px;">
+ <thead><tr style="background:rgba(48,56,65,0.05);">
+ <th style="padding:8px 10px; text-align:right;">#</th>
+ <th style="padding:8px 10px; text-align:right;">المدرب</th>
+ <th style="padding:8px 10px; text-align:right;">الفرع</th>
+ <th style="padding:8px 10px; text-align:right; min-width:220px;">إجمالي المحصّل</th>
+ <th style="padding:8px 10px; text-align:right; min-width:160px;">عدد اللاعبين</th>
+ </tr></thead>
+ <tbody>
+ ${rows
+   .map(
+     (r, i) => `<tr style="border-bottom:1px solid rgba(48,56,65,0.08);">
+ <td style="padding:8px 10px; font-size:15px;">${medal(i)}</td>
+ <td style="padding:8px 10px; font-weight:700;">${esc(r.name)}</td>
+ <td style="padding:8px 10px;">${branchBadge(r.branch)}</td>
+ <td style="padding:8px 10px;">
+ <div style="display:flex; align-items:center; gap:8px;">
+ <div style="flex:1; height:14px; background:rgba(48,56,65,0.07); border-radius:7px; overflow:hidden;"><div style="width:${Math.round((r.collected / maxMoney) * 100)}%; height:100%; background:var(--success); border-radius:7px;"></div></div>
+ <span style="font-weight:800; white-space:nowrap; color:var(--success);">${r.collected.toLocaleString()} ج.م</span>
+ </div>
+ </td>
+ <td style="padding:8px 10px;">
+ <div style="display:flex; align-items:center; gap:8px;">
+ <div style="flex:1; height:14px; background:rgba(48,56,65,0.07); border-radius:7px; overflow:hidden;"><div style="width:${Math.round((r.players / maxPlayers) * 100)}%; height:100%; background:var(--gold, #D4AF37); border-radius:7px;"></div></div>
+ <span style="font-weight:800; white-space:nowrap;">${r.players}</span>
+ </div>
+ </td>
+ </tr>`,
+   )
+   .join('')}
+ </tbody>
+ </table>`;
 }
 
 // Records a coach payout as an expense tagged with the coach's id.
@@ -3182,59 +3370,173 @@ function payCoachAdvance(id) {
   );
 }
 
+// Manual percentage payout: the user builds the collected-money list himself —
+// picking players from the coach's own groups (their total-paid pre-fills and
+// stays editable) and/or adding players by hand. The percentage is computed on
+// the sum the user assembles, so it never depends on how payments were tagged.
+let pctPayout = { coachId: null, rows: [] }; // rows: { key, name, amount }
+
 function payCoachPercentage(id) {
   const c = data.employees.find(e => e.id === id);
   if (!c) return;
   const rate = num(c.percentageRate);
-  const collected = collectedForCoach(c.name); // auto base = total collected from his players
+  pctPayout = { coachId: id, rows: [] };
+
+  // Players currently in any group led by this coach (deduped).
+  const ids = new Set();
+  (data.groups || [])
+    .filter(g => (g.trainer || '').trim() === c.name)
+    .forEach(g => (g.memberIds || []).forEach(m => ids.add(m)));
+  const groupPlayers = [...ids].map(mid => data.trainees.find(t => t.id === mid)).filter(Boolean);
+
   openModal(
     `صرف نسبة - ${c.name}`,
     `
- <p style="color:rgba(48,56,65,0.6); margin-bottom:8px;">النسبة المتفق عليها: <strong>${rate}%</strong></p>
- <p style="color:rgba(48,56,65,0.6); margin-bottom:16px;">إجمالي المحصّل من لاعبيه: <strong>${collected.toLocaleString()} ج.م</strong></p>
+ <p style="color:rgba(48,56,65,0.6); margin-bottom:12px;">النسبة المتفق عليها: <strong>${rate}%</strong></p>
  <div class="form-group">
- <label>إجمالي المبلغ المحصّل (ج.م)</label>
- <input type="number" id="pay-base-input" oninput="updatePercentPreview('${esc(id)}')" value="${collected}" placeholder="المبلغ المحصّل">
+ <label>أضف لاعب من جروب الكابتن</label>
+ <div style="display:flex; gap:8px;">
+ <select id="pct-group-select" style="flex:1;">
+ <option value="">${groupPlayers.length ? '— اختر لاعب —' : 'لا يوجد لاعبون في جروبات الكابتن'}</option>
+ ${groupPlayers.map(t => `<option value="${esc(t.id)}">${esc(t.name)} — دفع ${totalPaidByPlayer(t).toLocaleString()} ج.م</option>`).join('')}
+ </select>
+ <button class="btn btn-outline btn-sm" onclick="addPctFromGroup('${esc(id)}')">➕ أضف</button>
  </div>
- <div id="percent-preview" style="font-weight:800; color:var(--success); font-size:18px; margin:14px 0;">النسبة المستحقة: ${Math.round((collected * rate) / 100).toLocaleString()} ج.م</div>
- <div style="display:flex; gap:10px;">
- <button class="btn btn-success" style="flex:1;" onclick="confirmCoachPayment('${esc(id)}','نسبة')">تأكيد الصرف</button>
+ </div>
+ <div class="form-group">
+ <label>أو أضف لاعب يدوياً</label>
+ <div style="display:flex; gap:8px;">
+ <input type="text" id="pct-manual-name" placeholder="اسم اللاعب" style="flex:1;">
+ <input type="number" id="pct-manual-amount" placeholder="دفع كام" style="width:120px;">
+ <button class="btn btn-outline btn-sm" onclick="addPctManual('${esc(id)}')">➕</button>
+ </div>
+ </div>
+ <div id="pct-rows"></div>
+ <div style="display:flex; gap:10px; margin-top:16px;">
+ <button class="btn btn-success" style="flex:1;" onclick="confirmPctPayout('${esc(id)}')">تأكيد الصرف</button>
  <button class="btn btn-outline" style="flex:1;" onclick="closeModal()">إلغاء</button>
  </div>
  `,
   );
+  renderPctRows(id);
 }
 
-function updatePercentPreview(id) {
+// Adds the player chosen from the group dropdown, pre-filling their total paid.
+function addPctFromGroup(id) {
+  const sel = document.getElementById('pct-group-select');
+  const tid = sel && sel.value;
+  if (!tid) return;
+  const t = data.trainees.find(x => x.id === tid);
+  if (!t) return;
+  if (pctPayout.rows.some(r => r.key === tid)) {
+    showNotification('اللاعب مضاف بالفعل', 'warning');
+    return;
+  }
+  pctPayout.rows.push({ key: tid, name: t.name, amount: totalPaidByPlayer(t) });
+  if (sel) sel.value = '';
+  renderPctRows(id);
+}
+
+// Adds a hand-typed player + amount.
+function addPctManual(id) {
+  const nameEl = document.getElementById('pct-manual-name');
+  const amtEl = document.getElementById('pct-manual-amount');
+  const name = (nameEl.value || '').trim();
+  const amount = num(amtEl.value);
+  if (!name) {
+    showNotification('اكتب اسم اللاعب', 'warning');
+    return;
+  }
+  pctPayout.rows.push({ key: 'm-' + Date.now(), name, amount });
+  nameEl.value = '';
+  amtEl.value = '';
+  renderPctRows(id);
+}
+
+function removePctRow(id, key) {
+  pctPayout.rows = pctPayout.rows.filter(r => r.key !== key);
+  renderPctRows(id);
+}
+
+// Editing an amount inline: update state + totals only (keeps input focus).
+function updatePctAmount(id, key, value) {
+  const r = pctPayout.rows.find(x => x.key === key);
+  if (r) r.amount = num(value);
+  updatePctTotals(id);
+}
+
+function renderPctRows(id) {
+  const box = document.getElementById('pct-rows');
+  if (!box) return;
+  const rows = pctPayout.rows;
+  box.innerHTML = `
+ <div style="max-height:200px; overflow-y:auto; border:1px solid rgba(48,56,65,0.12); border-radius:8px;">
+ <table style="width:100%; border-collapse:collapse; font-size:13px;">
+ <thead><tr style="background:rgba(48,56,65,0.05);">
+ <th style="padding:6px 10px; text-align:right;">اللاعب</th>
+ <th style="padding:6px 10px;">دفع (ج.م)</th>
+ <th style="padding:6px 10px; width:40px;"></th>
+ </tr></thead>
+ <tbody>
+ ${
+   rows.length
+     ? rows
+         .map(
+           r => `<tr style="border-bottom:1px solid rgba(48,56,65,0.08);">
+ <td style="padding:5px 10px;">${esc(r.name)}</td>
+ <td style="padding:5px 10px;"><input type="number" value="${r.amount}" oninput="updatePctAmount('${esc(id)}','${esc(r.key)}', this.value)" style="width:110px;"></td>
+ <td style="padding:5px 10px;"><button class="btn btn-danger btn-sm" onclick="removePctRow('${esc(id)}','${esc(r.key)}')">✕</button></td>
+ </tr>`,
+         )
+         .join('')
+     : '<tr><td colspan="3" style="padding:14px; text-align:center; color:rgba(48,56,65,0.4);">لم تُضف أي لاعبين بعد</td></tr>'
+ }
+ </tbody>
+ </table>
+ </div>
+ <div id="pct-totals" style="margin-top:12px;"></div>`;
+  updatePctTotals(id);
+}
+
+function updatePctTotals(id) {
+  const el = document.getElementById('pct-totals');
+  if (!el) return;
+  const c = data.employees.find(e => e.id === id);
+  const rate = c ? num(c.percentageRate) : 0;
+  const total = pctPayout.rows.reduce((s, r) => s + num(r.amount), 0);
+  const due = Math.round((total * rate) / 100);
+  el.innerHTML = `
+ <div style="display:flex; justify-content:space-between; font-weight:700;"><span>إجمالي المحصّل (${pctPayout.rows.length} لاعب):</span><span>${total.toLocaleString()} ج.م</span></div>
+ <div style="display:flex; justify-content:space-between; font-weight:800; color:var(--success); font-size:18px; margin-top:6px;"><span>النسبة المستحقة (${rate}%):</span><span>${due.toLocaleString()} ج.م</span></div>`;
+}
+
+function confirmPctPayout(id) {
   const c = data.employees.find(e => e.id === id);
   if (!c) return;
-  const base = num(document.getElementById('pay-base-input').value);
-  const amount = Math.round((base * num(c.percentageRate)) / 100);
-  document.getElementById('percent-preview').textContent = `النسبة المستحقة: ${amount.toLocaleString()} ج.م`;
+  const total = pctPayout.rows.reduce((s, r) => s + num(r.amount), 0);
+  if (total <= 0) {
+    showNotification('أضف لاعبين بمبالغ صحيحة أولاً', 'warning');
+    return;
+  }
+  const rate = num(c.percentageRate);
+  const amount = Math.round((total * rate) / 100);
+  const desc = `نسبة ${rate}% من ${total.toLocaleString()} (${pctPayout.rows.length} لاعب) - ${c.name}`;
+  recordCoachExpense(c, 'نسبة', amount, desc);
+  closeModal();
+  showNotification(`تم صرف ${amount.toLocaleString()} ج.م لـ ${c.name}`);
 }
 
-// Shared confirm handler for all three coach payout popups.
+// Confirm handler for the salary & advance payouts (percentage has its own
+// manual flow — see confirmPctPayout).
 function confirmCoachPayment(id, type) {
   const c = data.employees.find(e => e.id === id);
   if (!c) return;
-  let amount, desc;
-  if (type === 'نسبة') {
-    const base = num(document.getElementById('pay-base-input').value);
-    if (base <= 0) {
-      showNotification('أدخل مبلغاً صالحاً', 'warning');
-      return;
-    }
-    const rate = num(c.percentageRate);
-    amount = Math.round((base * rate) / 100);
-    desc = `نسبة ${rate}% من ${base.toLocaleString()} - ${c.name}`;
-  } else {
-    amount = num(document.getElementById('pay-amount-input').value);
-    if (amount <= 0) {
-      showNotification('أدخل مبلغاً صالحاً', 'warning');
-      return;
-    }
-    desc = type === 'سلفة' ? `سلفة - ${c.name}` : `راتب ${c.name}`;
+  const amount = num(document.getElementById('pay-amount-input').value);
+  if (amount <= 0) {
+    showNotification('أدخل مبلغاً صالحاً', 'warning');
+    return;
   }
+  const desc = type === 'سلفة' ? `سلفة - ${c.name}` : `راتب ${c.name}`;
   recordCoachExpense(c, type, amount, desc);
   closeModal();
   showNotification(`تم صرف ${amount.toLocaleString()} ج.م لـ ${c.name}`);
@@ -3755,7 +4057,7 @@ function openSession(id) {
 
 // Adds a player to the session and records their attendance (blocking
 // expired subscriptions and consuming a session for session-based plans).
-function addSessionAttendee(id) {
+async function addSessionAttendee(id) {
   const s = (data.sessions || []).find(x => x._docId === id);
   if (!s || s.status !== 'active') return;
   const code = document.getElementById('session-add-select').value;
@@ -3774,8 +4076,11 @@ function addSessionAttendee(id) {
     const time = new Date().toLocaleTimeString('ar-EG');
     const entry = { id: code, name: t.name, date: today, time, status: 'حاضر', branch: t.branch || 'غير محدد' };
     data.attendance.push(entry);
-    dbAddDoc(attendanceCol, entry);
-    if (t.type === 'subscription' && info.kind === 'sessions') {
+    // DB unique index is the cross-device duplicate guard (see recordAttendance).
+    const res = await dbAddDoc(attendanceCol, entry);
+    if (res && res.duplicate) {
+      data.attendance.splice(data.attendance.indexOf(entry), 1);
+    } else if (t.type === 'subscription' && info.kind === 'sessions') {
       t.sessionsRemaining = num(t.sessionsRemaining) - 1;
       if (t.sessionsRemaining <= 0) t.status = 'منتهي';
       dbSetDoc(traineesCol, t.id, t);
@@ -4333,29 +4638,29 @@ function isSalaryType(type) {
 // The branches, used by the per-branch report pages.
 const BRANCHES = ['فرع المريوطيه', 'فرع الحدايق', 'فرع الهرم'];
 
-// The sports offered, and the levels that only apply to "جمباز فني".
+// The sports offered by the academy (order also fixes each sport's card-number
+// block — see sportCardBase). Per-sport level/sector rules live in SPORT_LEVELS.
 const SPORTS = [
   'جمباز فني',
   'جمباز ايروبك',
   'كاراتيه',
   'كونغ فو ساندا',
   'كيك بوكس',
-  'تيكوندو',
+  'تايكوندو',
   'كونغ فو اساليب',
   'ملاكمه',
   'موياي تاي',
   'كالستانكس',
   'فيتنس تخصصي',
 ];
-const GYM_LEVELS = ['قطاع مدارس', 'قطاع تجهيزي', 'قطاع فريق'];
 
 // Sports that carry a per-player "level/stage" value, and how it's entered.
 // The value is stored in the SAME `level` field the app already uses:
 //  - kind 'text'   → free-text stage (e.g. "تحت 8" / "تحت 7") for gymnastics.
 //  - kind 'select' → a fixed subscription sector for fitness (مدارس / تجهيزي).
 const SPORT_LEVELS = {
-  'جمباز فني': { label: 'المرحلة', kind: 'text', placeholder: 'مثال: تحت 8 / تحت 7' },
-  'جمباز ايروبك': { label: 'المرحلة', kind: 'text', placeholder: 'مثال: تحت 8 / تحت 7' },
+  'جمباز فني': { label: 'القطاع', kind: 'select', options: ['قطاع مدارس', 'قطاع تجهيزي', 'قطاع فريق'] },
+  'جمباز ايروبك': { label: 'القطاع', kind: 'select', options: ['قطاع مدارس', 'قطاع تجهيزي', 'قطاع فريق'] },
   'فيتنس تخصصي': { label: 'الاشتراك', kind: 'select', options: ['مدارس', 'تجهيزي'] },
 };
 function sportLevelSpec(sport) {
@@ -4377,7 +4682,9 @@ function levelFieldHTML(id, spec, current) {
     return (
       label +
       `<select id="${id}"><option value="">— اختر —</option>` +
-      spec.options.map(o => `<option value="${esc(o)}" ${o === current ? 'selected' : ''}>${esc(o)}</option>`).join('') +
+      spec.options
+        .map(o => `<option value="${esc(o)}" ${o === current ? 'selected' : ''}>${esc(o)}</option>`)
+        .join('') +
       `</select>`
     );
   }
@@ -4390,7 +4697,7 @@ function levelFieldHTML(id, spec, current) {
 // of sessions per month is fixed per sport/sector and only auto-fills the form
 // (still editable). Sports NOT listed here (ملاكمة / كونغ فو أساليب / كالستانكس
 // / جمباز أيروبك) have no fixed count and are entered manually.
-const COMBAT_MONTHLY_SESSIONS = { كاراتيه: 8, 'كونغ فو ساندا': 8, 'كيك بوكس': 8, تيكوندو: 8, 'موياي تاي': 8 };
+const COMBAT_MONTHLY_SESSIONS = { كاراتيه: 8, 'كونغ فو ساندا': 8, 'كيك بوكس': 8, تايكوندو: 8, 'موياي تاي': 8 };
 const GYM_SECTOR_SESSIONS = { 'قطاع مدارس': 8, 'قطاع تجهيزي': 12, 'قطاع فريق': 16 };
 // Returns the fixed monthly sessions for a sport (+ gym sector), or '' if the
 // sport is one of the manual ones.
@@ -4404,11 +4711,6 @@ function sportOptionsHTML(selected) {
   return (
     '<option value="">— اختر الرياضة —</option>' +
     SPORTS.map(s => `<option value="${esc(s)}" ${s === selected ? 'selected' : ''}>${esc(s)}</option>`).join('')
-  );
-}
-function levelOptionsHTML(selected) {
-  return GYM_LEVELS.map(l => `<option value="${esc(l)}" ${l === selected ? 'selected' : ''}>${esc(l)}</option>`).join(
-    '',
   );
 }
 function methodOptionsHTML(selected) {
@@ -4456,7 +4758,15 @@ function sportCardBase(sport) {
 // Which sport a card code belongs to — the sport whose block (base..base+999)
 // contains the number. Lets each card show its own sport's name + colour.
 function sportForCode(code) {
-  const v = parseInt(normalizeDigits(code), 10);
+  const raw = String(code || '').trim();
+  // New structured format BRANCH-SPORT-... : the sport is the 2nd segment.
+  if (raw.includes('-')) {
+    const ab = raw.split('-')[1];
+    if (ab && CODE_TO_SPORT[ab]) return CODE_TO_SPORT[ab];
+    // otherwise fall through (e.g. legacy 'Wasl-1234' has no sport).
+  }
+  // Legacy numeric block codes.
+  const v = parseInt(normalizeDigits(raw), 10);
   if (isNaN(v)) return '';
   for (const s of SPORTS) {
     const base = sportCardBase(s);
@@ -4465,23 +4775,74 @@ function sportForCode(code) {
   return '';
 }
 
-// A distinct accent colour per sport, so every sport's cards look different.
-// Unknown sports fall back to the classic gold.
-const SPORT_COLORS = {
-  'جمباز فني': '#C0392B',
-  'جمباز ايروبك': '#E67E22',
-  كاراتيه: '#2980B9',
-  'كونغ فو ساندا': '#8E44AD',
-  'كيك بوكس': '#16A085',
-  تيكوندو: '#27AE60',
-  'كونغ فو اساليب': '#B7950B',
-  ملاكمه: '#7B241C',
-  'موياي تاي': '#BA4A00',
-  كالستانكس: '#E84393',
-  'فيتنس تخصصي': '#34495E',
+// Card accent colour PER BRANCH — cards keep the same dark theme, only the
+// accent (border, QR frame, code, logo tint) changes by branch.
+const BRANCH_COLORS = {
+  'فرع المريوطيه': '#D4AF37', // جولد
+  'فرع الحدايق': '#2ECC71', // أخضر
+  'فرع الهرم': '#3498DB', // أزرق
 };
-function sportColor(sport) {
-  return SPORT_COLORS[(sport || '').trim()] || '#D4AF37';
+function branchColor(branch) {
+  return BRANCH_COLORS[(branch || '').trim()] || '#D4AF37';
+}
+
+// ==================== STRUCTURED CARD CODES ====================
+// Printed-card / QR format: BRANCH-SPORT-Uage[-SECTOR]-NUMBER
+//   general    : C-KA-U9-3001
+//   gymnastics : C-WAG-U9-T-1001   (T=فريق  P=تجهيزي  S=مدارس)
+// NUMBER is each sport's own thousand-block (فني 1000+, ايروبك 2000+, كاراتيه
+// 3000+ ... skipping 10000 -> 11000, 12000), shared across all branches of that
+// sport. Old bare-numeric codes on already-registered players keep working.
+const BRANCH_CODES = { 'فرع المريوطيه': 'A', 'فرع الحدايق': 'B', 'فرع الهرم': 'C' };
+const SPORT_CODES = {
+  'جمباز فني': 'WAG',
+  'جمباز ايروبك': 'AERO',
+  كاراتيه: 'KA',
+  'كيك بوكس': 'KB',
+  تايكوندو: 'TK',
+  'كونغ فو ساندا': 'KS',
+  'كونغ فو اساليب': 'KW',
+  ملاكمه: 'BO',
+  'موياي تاي': 'MT',
+  كالستانكس: 'CL',
+  'فيتنس تخصصي': 'FT',
+};
+// Gymnastics-only sector, appended as a single letter before the serial.
+const GYM_SECTOR_CODES = { فريق: 'T', تجهيزي: 'P', مدارس: 'S' };
+const GYM_SECTORS = Object.keys(GYM_SECTOR_CODES); // ['فريق','تجهيزي','مدارس']
+const GYM_SPORTS = ['جمباز فني', 'جمباز ايروبك'];
+// Age bands offered on the print form (U + age). U9 is the common default.
+const AGE_BANDS = ['U5', 'U6', 'U7', 'U8', 'U9', 'U10', 'U11', 'U12', 'U13', 'U14', 'U15', 'U16', 'U18'];
+// Reverse map (abbreviation -> sport name) for decoding a scanned code.
+const CODE_TO_SPORT = Object.fromEntries(Object.entries(SPORT_CODES).map(([name, ab]) => [ab, name]));
+function isGymSport(sport) {
+  return GYM_SPORTS.includes((sport || '').trim());
+}
+
+// Builds the code prefix (everything before the serial), or null if the branch
+// or sport has no abbreviation. Gymnastics gets the extra sector letter.
+function cardPrefix(branch, sport, ageBand, sector) {
+  const b = BRANCH_CODES[branch];
+  const s = SPORT_CODES[sport];
+  if (!b || !s || !ageBand) return null;
+  const parts = [b, s, ageBand];
+  if (isGymSport(sport)) {
+    const sec = GYM_SECTOR_CODES[sector];
+    if (!sec) return null;
+    parts.push(sec);
+  }
+  return parts.join('-');
+}
+
+// Generates `n` full card codes for a print run: BRANCH-SPORT-Uage[-SECTOR]-NUMBER.
+// The NUMBER is drawn from the sport's own thousand-block (see generateSportCodes),
+// so every card of a sport stays inside its block regardless of branch/age/sector.
+function generateStructuredCodes(branch, sport, ageBand, sector, n) {
+  const prefix = cardPrefix(branch, sport, ageBand, sector);
+  if (!prefix) return null;
+  const nums = generateSportCodes(sport, n);
+  if (!nums) return null;
+  return nums.map(num => `${prefix}-${num}`);
 }
 
 // Generates `n` sequential card numbers for a sport, continuing after the
@@ -4489,12 +4850,51 @@ function sportColor(sport) {
 // per-block high-water mark so repeated prints keep advancing). If the block
 // fills, the rest roll into the shared reserve pool so numbers never repeat.
 const CARD_OVERFLOW_BASE = 90000; // shared pool used only if a sport's block fills up
+// Every serial already used by THIS sport within its block — read from BOTH old
+// bare-numeric codes AND new BRANCH-SPORT-...-NUMBER codes (all of a player's
+// cards, not just the primary id). Random 'Wasl-####' auto ids are ignored.
+function usedSerialsForSport(sport, base, blockEnd) {
+  const ab = SPORT_CODES[sport];
+  const used = [];
+  (data.trainees || []).forEach(t =>
+    traineeCodes(t).forEach(c => {
+      const s = String(c || '').trim();
+      let v = NaN;
+      if (/^\d+$/.test(s)) {
+        v = parseInt(normalizeDigits(s), 10); // old bare code
+      } else {
+        const seg = s.split('-');
+        if (seg[1] === ab) {
+          const m = s.match(/(\d+)$/); // new code of this sport
+          if (m) v = parseInt(normalizeDigits(m[1]), 10);
+        }
+      }
+      if (v >= base && v <= blockEnd) used.push(v);
+    }),
+  );
+  return used;
+}
+// Every trailing number already used in the shared reserve pool, any sport/format.
+function usedReserveSerials() {
+  const used = [];
+  (data.trainees || []).forEach(t =>
+    traineeCodes(t).forEach(c => {
+      const m = String(c || '')
+        .trim()
+        .match(/(\d+)$/);
+      if (m) {
+        const v = parseInt(normalizeDigits(m[1]), 10);
+        if (v >= CARD_OVERFLOW_BASE) used.push(v);
+      }
+    }),
+  );
+  return used;
+}
 function generateSportCodes(sport, n) {
   const base = sportCardBase(sport);
   if (base == null) return null; // no code for this sport
   const blockEnd = base + 999;
-  const usedNum = id => parseInt(normalizeDigits(id), 10);
-  const usedInBlock = data.trainees.map(t => usedNum(t.id)).filter(v => !isNaN(v) && v >= base && v <= blockEnd);
+  const usedInBlock = usedSerialsForSport(sport, base, blockEnd);
   const hwKey = `card-serial-${base}`;
   const hw = parseInt(localStorage.getItem(hwKey) || '0', 10);
   let next = Math.max(base - 1, hw, ...usedInBlock) + 1;
@@ -4508,7 +4908,7 @@ function generateSportCodes(sport, n) {
 
   if (codes.length < n) {
     const rKey = 'card-serial-reserve';
-    const usedReserve = data.trainees.map(t => usedNum(t.id)).filter(v => !isNaN(v) && v >= CARD_OVERFLOW_BASE);
+    const usedReserve = usedReserveSerials();
     let r = Math.max(CARD_OVERFLOW_BASE - 1, parseInt(localStorage.getItem(rKey) || '0', 10), ...usedReserve);
     while (codes.length < n) {
       r++;
@@ -4519,29 +4919,59 @@ function generateSportCodes(sport, n) {
   return codes;
 }
 
-// Prints branded blank cards for ONE sport: each card carries a sequential
-// number from that sport's block (so the number itself says which sport), the
-// sport name, a QR, and the sport's own colour. Laid out 8 per A4 page (2×4).
-// You write the player's name by hand, then enter the card's number in
-// "كود البطاقة" when you register that player.
+// Prints branded blank cards for one (branch + sport + age band [+ gym sector]):
+// each card carries a structured sequential code (BRANCH-SPORT-Uage[-SECTOR]-####)
+// that encodes everything, plus a QR of that code and the sport's own colour.
+// Laid out 8 per A4 page (2×4). You write the player's name by hand, then enter
+// the card's code in "كود البطاقة" when you register that player.
 function printBlankCards() {
-  const sport = document.getElementById('blank-cards-sport').value;
-  if (!sport || sportCardBase(sport) == null) {
+  const branch = val('blank-cards-branch');
+  const sport = val('blank-cards-sport');
+  const ageBand = val('blank-cards-age');
+  const sector = val('blank-cards-sector');
+
+  if (!branch) {
+    showNotification('اختر الفرع أولاً', 'warning');
+    return;
+  }
+  // Enforce: a branch-scoped device can only print its own branch's cards.
+  const dev = getDeviceBranch();
+  if (dev && branch !== dev) {
+    showNotification('لا يمكنك طباعة كروت لفرع آخر', 'danger');
+    return;
+  }
+  if (!sport || !SPORT_CODES[sport]) {
     showNotification('اختر الرياضة أولاً', 'warning');
     return;
   }
-  const qty = Math.min(parseInt(document.getElementById('blank-cards-qty').value) || 0, 1000);
+  if (!ageBand) {
+    showNotification('اختر المرحلة السنية', 'warning');
+    return;
+  }
+  if (isGymSport(sport) && !sector) {
+    showNotification('اختر القطاع (فريق/مدارس/تجهيزي) للجمباز', 'warning');
+    return;
+  }
+  const qty = Math.min(parseInt(val('blank-cards-qty')) || 0, 1000);
   if (qty <= 0) {
     showNotification('أدخل عدد الكروت', 'warning');
     return;
   }
 
+  const codes = generateStructuredCodes(branch, sport, ageBand, sector, qty);
+  if (!codes) {
+    showNotification('تعذّر تكوين كود الكرت — تحقق من الاختيارات', 'danger');
+    return;
+  }
   const logoUrl = new URL('src/logo-after.png', location.href).href;
-  const codes = generateSportCodes(sport, qty);
-  const color = sportColor(sport);
+  const color = branchColor(branch);
+  // Group text for the print window's title only (sport + gym sector).
+  const groupText = isGymSport(sport) ? `${sport} • ${sector}` : sport;
 
+  const back = `<div class="card back">${cardBackInnerHTML(logoUrl)}</div>`;
   const cardEls = codes.map(
-    code => `
+    code =>
+      `
  <div class="card">
  <div class="card-top">
  <div class="brand">
@@ -4553,15 +4983,15 @@ function printBlankCards() {
  <div class="divider"></div>
  <div class="card-body">
  <div class="card-info">
- <div class="lbl">الرياضة</div>
- <div class="member-plan">${esc(sport)}</div>
+ <div class="lbl">الفرع</div>
+ <div class="member-plan">${esc(branch)}</div>
  <div class="lbl">الكود</div>
  <div class="member-code">${esc(code)}</div>
  </div>
  <div class="qr-box"><div class="qr" data-code="${esc(code)}"></div></div>
  </div>
  <div class="card-footer">يُستخدم هذا الكود لتسجيل الحضور عند الدخول</div>
- </div>`,
+ </div>` + back,
   );
 
   // 8 cards per A4 page (2 columns × 4 rows), page break after each eight.
@@ -4577,7 +5007,7 @@ function printBlankCards() {
     return;
   }
   win.document.write(`
- <html dir="rtl" lang="ar"><head><title>كروت ${esc(sport)} (${qty})</title>
+ <html dir="rtl" lang="ar"><head><title>كروت ${esc(sport)} - ${esc(groupText)} - ${esc(branch)} (${qty})</title>
  <meta charset="UTF-8">
  <script src="${qrUrl}"><\/script>
  <style>
@@ -4590,13 +5020,14 @@ function printBlankCards() {
  .card {
  position: relative; width: 90mm; height: 56mm; overflow: hidden;
  background:
- radial-gradient(60mm 40mm at 88% 8%, ${color}33, transparent 60%),
- linear-gradient(135deg, #1B2433 0%, #243049 60%, #18212f 100%);
+ radial-gradient(60mm 40mm at 88% 8%, ${color}61, transparent 62%),
+ radial-gradient(50mm 34mm at 8% 100%, ${color}38, transparent 65%),
+ linear-gradient(135deg, #000000 0%, #0A0A0A 55%, #000000 100%);
  border-radius: 8px; padding: 4.5mm 5mm;
  display: flex; flex-direction: column; justify-content: space-between; color: #E9EDF3;
  }
- .card::before { content: ''; position: absolute; inset: 1.1mm; border: 0.5mm solid ${color}; border-radius: 6px; }
- .card::after { content: ''; position: absolute; top: 0; right: 0; left: 0; height: 1.6mm; background: ${color}; }
+ /* card border (edges) removed */
+ /* top colour strip removed */
  .card-top { display: flex; justify-content: space-between; align-items: center; z-index: 1; }
  .club-name { font-size: 15px; font-weight: 900; color: #fff; letter-spacing: 1px; }
  .club-name span { color: ${color}; }
@@ -4610,6 +5041,14 @@ function printBlankCards() {
  .member-code { font-size: 18px; font-family: 'Courier New', monospace; letter-spacing: 2px; color: ${color}; font-weight: 800; margin-top: 1mm; }
  .qr-box { background: #ffffff; padding: 1.2mm; border-radius: 1.5mm; line-height: 0; box-shadow: 0 0 0 0.4mm ${color}; }
  .card-footer { font-size: 6.5px; color: ${color}; text-align: center; z-index: 1; }
+ .card-wm { position: absolute; width: 40mm; height: auto; top: 50%; left: 50%; transform: translate(-50%, -50%); opacity: 0.06; filter: brightness(0) invert(1); z-index: 0; }
+ .card.back { justify-content: center; align-items: center; text-align: center; gap: 1.5mm; }
+ .back-logo { height: 17mm; width: auto; z-index: 1; }
+ .back-name { font-size: 15px; font-weight: 900; color: #fff; letter-spacing: 1px; z-index: 1; }
+ .back-name span { color: ${color}; }
+ .back-contacts { z-index: 1; margin-top: 1mm; }
+ .bc { font-size: 8px; color: #D6DBE2; line-height: 1.75; letter-spacing: 0.3px; }
+ .bc.bc-phones { color: ${color}; font-weight: 800; font-size: 9px; margin-bottom: 0.8mm; }
  </style>
  </head>
  <body>
@@ -6050,6 +6489,48 @@ async function startApp(user) {
   populateRegTrainerSelect();
 
   applyRolePermissions(currentRole);
+  initCollapsibleCards();
+}
+
+// ==================== COLLAPSIBLE CARDS & TABLE FILTERS ====================
+// Adds a click arrow to every content card's title that folds the card body,
+// so data-heavy sections can be tucked away. State persists per card (by title).
+function initCollapsibleCards() {
+  document.querySelectorAll('.card > .card-title').forEach(title => {
+    if (title.querySelector('.collapse-arrow')) return; // already enhanced
+    const card = title.parentElement;
+    const key = 'collapse:' + (title.textContent || '').trim().slice(0, 40);
+    const arrow = document.createElement('span');
+    arrow.className = 'collapse-arrow';
+    const collapsed = localStorage.getItem(key) === '1';
+    if (collapsed) card.classList.add('collapsed');
+    arrow.textContent = collapsed ? '▸' : '▾';
+    arrow.onclick = () => toggleCardCollapse(card, key);
+    title.insertBefore(arrow, title.firstChild);
+  });
+}
+function toggleCardCollapse(card, key) {
+  const collapsed = card.classList.toggle('collapsed');
+  const arrow = card.querySelector('.card-title .collapse-arrow');
+  if (arrow) arrow.textContent = collapsed ? '▸' : '▾';
+  try {
+    if (collapsed) localStorage.setItem(key, '1');
+    else localStorage.removeItem(key);
+  } catch (e) {
+    /* storage full — non-critical */
+  }
+}
+
+// Generic quick filter: hides table rows whose text doesn't contain the query.
+// Works on any table by tbody id — reapplied on each keystroke.
+function filterTableRows(input, tbodyId) {
+  const q = (input.value || '').trim().toLowerCase();
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  tbody.querySelectorAll('tr').forEach(tr => {
+    if (tr.querySelector('td[colspan]')) return; // keep "empty" placeholder rows
+    tr.style.display = !q || tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
 }
 
 // ==================== INIT ====================
